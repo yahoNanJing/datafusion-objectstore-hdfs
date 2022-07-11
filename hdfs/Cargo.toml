@@ -26,8 +26,8 @@ rust-version = "1.59"
 [dependencies]
 async-trait = "0.1.41"
 chrono = { version = "0.4" }
-datafusion-data-access = { git = "https://github.com/apache/arrow-datafusion.git", rev = "41b4e491663029f653e491b110d0b5e74d08a0b6" }
-fs-hdfs = "^0.1.6"
+object_store = "0.3.0"
+fs-hdfs = "^0.1.8"
 futures = "0.3"
 
 [dev-dependencies]
