@@ -16,22 +16,24 @@
 // under the License.
 
 //! Object store that represents the HDFS File System.
-use std::collections::HashMap;
-use std::fmt::Debug;
-use std::io::{BufReader, Read};
+
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::fmt::{Display, Formatter};
+use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::{DateTime, NaiveDateTime, Utc};
-use datafusion_data_access::{
-    object_store::{
-        FileMetaStream, ListEntryStream, ObjectReader, ObjectReaderStream, ObjectStore,
-    },
-    FileMeta, Result, SizedFile,
-};
-use futures::AsyncRead;
-use futures::{stream, StreamExt};
-use hdfs::hdfs::{get_hdfs_by_full_path, FileStatus, HdfsErr, HdfsFile, HdfsFs};
+use futures::{stream::BoxStream, StreamExt};
+use hdfs::err::HdfsErr::FileNotFound;
+use hdfs::hdfs::{FileStatus, HdfsErr, HdfsFs};
+use hdfs::walkdir::HdfsWalkDir;
+use itertools::Itertools;
+use object_store::path;
+use object_store::path::Path;
+use object_store::{Error, GetResult, ListResult, ObjectMeta, ObjectStore, Result};
 
 /// scheme for HDFS File System
 pub static HDFS_SCHEME: &str = "hdfs";
@@ -41,104 +43,6 @@ pub static VIEWFS_SCHEME: &str = "viewfs";
 #[derive(Debug)]
 /// Hadoop File System as Object Store.
 pub struct HadoopFileSystem;
-
-#[async_trait]
-impl ObjectStore for HadoopFileSystem {
-    async fn list_file(&self, prefix: &str) -> Result<FileMetaStream> {
-        let hdfs = get_hdfs_by_full_path(prefix).map_err(to_error)?;
-        let mut leaf_files = vec![];
-        find_leaf_files_in_dir(hdfs, prefix, &mut leaf_files)?;
-        Ok(Box::pin(stream::iter(leaf_files).map(Ok)))
-    }
-
-    async fn list_dir(&self, _prefix: &str, _delimiter: Option<String>) -> Result<ListEntryStream> {
-        todo!()
-    }
-
-    fn file_reader(&self, file: SizedFile) -> Result<Arc<dyn ObjectReader>> {
-        Ok(Arc::new(HadoopFile::new(file)?))
-    }
-}
-
-#[derive(Clone, Debug)]
-struct HadoopFile {
-    file: Arc<HdfsFile>,
-    file_meta: SizedFile,
-}
-
-impl HadoopFile {
-    fn new(file_meta: SizedFile) -> Result<Self> {
-        let fs = get_hdfs_by_full_path(&file_meta.path).map_err(to_error)?;
-        let file = Arc::new(fs.open(&file_meta.path).map_err(to_error)?);
-        Ok(Self { file, file_meta })
-    }
-}
-
-#[async_trait]
-impl ObjectReader for HadoopFile {
-    async fn chunk_reader(&self, _start: u64, _length: usize) -> Result<Box<dyn AsyncRead>> {
-        todo!("implement once async file readers are available (arrow-rs#78, arrow-rs#111)")
-    }
-
-    fn sync_chunk_reader(&self, start: u64, length: usize) -> Result<Box<dyn Read + Send + Sync>> {
-        let reader = HadoopFileReader {
-            file: self.file.clone(),
-            offset: start,
-        };
-        self.file.seek(start);
-        Ok(Box::new(BufReader::new(reader.take(length as u64))))
-    }
-
-    fn length(&self) -> u64 {
-        self.file_meta.size
-    }
-}
-
-struct HadoopFileReader {
-    file: Arc<HdfsFile>,
-    offset: u64,
-}
-
-impl Read for HadoopFileReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.file
-            .read_with_pos(self.offset as i64, buf)
-            .map(|read_len| {
-                self.offset += read_len as u64;
-                read_len as usize
-            })
-            .map_err(to_error)
-    }
-}
-
-/// Find out all leaf files under a directory
-fn find_leaf_files_in_dir(
-    hdfs: Arc<HdfsFs>,
-    path: &str,
-    leaf_files: &mut Vec<FileMeta>,
-) -> Result<()> {
-    for file in hdfs.list_status(path).map_err(to_error)? {
-        if file.is_directory() {
-            find_leaf_files_in_dir(hdfs.clone(), file.name(), leaf_files)?;
-        } else if file.is_file() {
-            leaf_files.push(get_meta(file.name().to_owned(), file));
-        }
-    }
-    Ok(())
-}
-
-fn get_meta(path: String, file_status: FileStatus) -> FileMeta {
-    FileMeta {
-        sized_file: SizedFile {
-            path,
-            size: file_status.len() as u64,
-        },
-        last_modified: Some(DateTime::<Utc>::from_utc(
-            NaiveDateTime::from_timestamp(file_status.last_modified(), 0),
-            Utc,
-        )),
-    }
-}
 
 /// Get object stores with its corresponding schemes
 pub fn get_hadoop_object_stores() -> HashMap<String, Arc<dyn ObjectStore>> {
@@ -151,188 +55,367 @@ pub fn get_hadoop_object_stores() -> HashMap<String, Arc<dyn ObjectStore>> {
     ret
 }
 
-/// Create a stream of `ObjectReader` by converting each file in the `files` vector
-/// into instances of `HadoopFileReader`
-pub fn hadoop_object_reader_stream(files: Vec<String>) -> ObjectReaderStream {
-    Box::pin(futures::stream::iter(files).map(move |f| Ok(hadoop_object_reader(f))))
+impl HadoopFileSystem {
+    /// Return filesystem path of the given location
+    fn path_to_filesystem(location: &Path) -> String {
+        let mut path_parts = location.parts();
+        let head_part = path_parts
+            .next()
+            .expect(format!("There should be more than 1 parts in {}", location).as_ref());
+        format!(
+            "{}//{}",
+            head_part.as_ref(),
+            path_parts.map(|part| part.as_ref().to_owned()).join("/")
+        )
+    }
 }
 
-/// Helper method to convert a file location to a `LocalFileReader`
-pub fn hadoop_object_reader(file: String) -> Arc<dyn ObjectReader> {
-    HadoopFileSystem
-        .file_reader(hadoop_unpartitioned_file(file).sized_file)
-        .expect("File not found")
+impl Display for HadoopFileSystem {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HadoopFileSystem")
+    }
 }
 
-/// Helper method to fetch the file size and date at given path and create a `FileMeta`
-pub fn hadoop_unpartitioned_file(file: String) -> FileMeta {
-    let fs = get_hdfs_by_full_path(&file).expect("HdfsFs not found");
-    let file_status = fs.get_file_status(&file).expect("File status not found");
-    get_meta(file, file_status)
+#[async_trait]
+impl ObjectStore for HadoopFileSystem {
+    // Current implementation is very simple due to missing configs,
+    // like whether able to overwrite, whether able to create parent directories, etc
+    async fn put(&self, location: &Path, bytes: Bytes) -> object_store::Result<()> {
+        let location = HadoopFileSystem::path_to_filesystem(location);
+
+        maybe_spawn_blocking(move || {
+            let hdfs = get_hdfs(&location)?;
+            let file = match hdfs.create(&location) {
+                Ok(f) => f,
+                Err(e) => {
+                    return Err(to_error(e));
+                }
+            };
+
+            file.write(bytes.as_ref()).map_err(to_error)?;
+
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get(&self, location: &Path) -> object_store::Result<GetResult> {
+        let location = HadoopFileSystem::path_to_filesystem(location);
+
+        let blob: Bytes = maybe_spawn_blocking(move || {
+            let hdfs = get_hdfs(&location)?;
+
+            let file = hdfs.open(&location).map_err(to_error)?;
+
+            let file_status = file.get_file_status().map_err(to_error)?;
+
+            let to_read = file_status.len();
+            let mut buf = vec![0; to_read];
+            let read = file.read(buf.as_mut_slice()).map_err(to_error)?;
+            assert_eq!(
+                to_read as i32, read,
+                "Read path {} with expected size {} and actual size {}",
+                &location, to_read, read
+            );
+
+            Ok(buf.into())
+        })
+        .await?;
+
+        Ok(GetResult::Stream(
+            futures::stream::once(async move { Ok(blob) }).boxed(),
+        ))
+    }
+
+    async fn get_range(&self, location: &Path, range: Range<usize>) -> object_store::Result<Bytes> {
+        let location = HadoopFileSystem::path_to_filesystem(location);
+
+        maybe_spawn_blocking(move || {
+            let hdfs = get_hdfs(&location)?;
+
+            let file = hdfs.open(&location).map_err(to_error)?;
+
+            let to_read = range.end - range.start;
+            let mut buf = vec![0; to_read];
+            let read = file
+                .read_with_pos(range.start as i64, buf.as_mut_slice())
+                .map_err(to_error)?;
+            assert_eq!(
+                to_read as i32, read,
+                "Read path {} from {} with expected size {} and actual size {}",
+                &location, range.start, to_read, read
+            );
+
+            Ok(buf.into())
+        })
+        .await
+    }
+
+    async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
+        let location = HadoopFileSystem::path_to_filesystem(location);
+
+        maybe_spawn_blocking(move || {
+            let hdfs = get_hdfs(&location)?;
+
+            let file_status = hdfs.get_file_status(&location).map_err(to_error)?;
+            Ok(convert_metadata(file_status))
+        })
+        .await
+    }
+
+    async fn delete(&self, location: &Path) -> object_store::Result<()> {
+        let location = HadoopFileSystem::path_to_filesystem(location);
+
+        maybe_spawn_blocking(move || {
+            let hdfs = get_hdfs(&location)?;
+
+            hdfs.delete(&location, false).map_err(to_error)?;
+
+            Ok(())
+        })
+        .await
+    }
+
+    /// List all of the leaf files under the prefix path.
+    /// It will recursively search leaf files whose depth is larger than 1
+    async fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> object_store::Result<BoxStream<'_, object_store::Result<ObjectMeta>>> {
+        let prefix = prefix.expect("Prefix for hdfs should not be None");
+        let walkdir = HdfsWalkDir::new(prefix.as_ref().to_owned())
+            .map_err(to_error)?
+            .min_depth(1);
+
+        let s =
+            walkdir.into_iter().flat_map(move |result_dir_entry| {
+                match convert_walkdir_result(result_dir_entry) {
+                    Err(e) => Some(Err(e)),
+                    Ok(None) => None,
+                    Ok(entry @ Some(_)) => entry
+                        .filter(|dir_entry| dir_entry.is_file())
+                        .map(|entry| Ok(convert_metadata(entry))),
+                }
+            });
+
+        // If no tokio context, return iterator directly as no
+        // need to perform chunked spawn_blocking reads
+        if tokio::runtime::Handle::try_current().is_err() {
+            return Ok(futures::stream::iter(s).boxed());
+        }
+
+        // Otherwise list in batches of CHUNK_SIZE
+        const CHUNK_SIZE: usize = 1024;
+
+        let buffer = VecDeque::with_capacity(CHUNK_SIZE);
+        let stream = futures::stream::try_unfold((s, buffer), |(mut s, mut buffer)| async move {
+            if buffer.is_empty() {
+                (s, buffer) = tokio::task::spawn_blocking(move || {
+                    for _ in 0..CHUNK_SIZE {
+                        match s.next() {
+                            Some(r) => buffer.push_back(r),
+                            None => break,
+                        }
+                    }
+                    (s, buffer)
+                })
+                .await?;
+            }
+
+            match buffer.pop_front() {
+                Some(Err(e)) => Err(e),
+                Some(Ok(meta)) => Ok(Some((meta, (s, buffer)))),
+                None => Ok(None),
+            }
+        });
+
+        Ok(stream.boxed())
+    }
+
+    /// List files and directories directly under the prefix path.
+    /// It will not recursively search leaf files whose depth is larger than 1
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        let prefix = prefix.cloned().expect("Prefix for hdfs should not be None");
+
+        maybe_spawn_blocking(move || {
+            let walkdir = HdfsWalkDir::new(prefix.as_ref().to_owned())
+                .map_err(to_error)?
+                .min_depth(1)
+                .max_depth(1);
+
+            let mut common_prefixes = BTreeSet::new();
+            let mut objects = Vec::new();
+
+            for entry_res in walkdir.into_iter().map(convert_walkdir_result) {
+                if let Some(entry) = entry_res? {
+                    let is_directory = entry.is_directory();
+                    let entry_location = Path::from(entry.name());
+
+                    let mut parts = match entry_location.prefix_match(&prefix) {
+                        Some(parts) => parts,
+                        None => continue,
+                    };
+
+                    let common_prefix = match parts.next() {
+                        Some(p) => p,
+                        None => continue,
+                    };
+
+                    drop(parts);
+
+                    if is_directory {
+                        common_prefixes.insert(prefix.child(common_prefix));
+                    } else {
+                        objects.push(convert_metadata(entry));
+                    }
+                }
+            }
+
+            Ok(ListResult {
+                next_token: None,
+                common_prefixes: common_prefixes.into_iter().collect(),
+                objects,
+            })
+        })
+        .await
+    }
+
+    /// Copy an object from one path to another.
+    /// If there exists an object at the destination, it will be overwritten.
+    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        let from = HadoopFileSystem::path_to_filesystem(from);
+        let to = HadoopFileSystem::path_to_filesystem(to);
+
+        maybe_spawn_blocking(move || {
+            // We need to make sure the source exist
+            let from_hdfs = get_hdfs(&from)?;
+            if !from_hdfs.exist(&from) {
+                return Err(Error::NotFound {
+                    path: from.clone(),
+                    source: Box::new(HdfsErr::FileNotFound(from.clone())),
+                });
+            }
+            // Delete destination if exists
+            let to_hdfs = get_hdfs(&to)?;
+            if to_hdfs.exist(&to) {
+                to_hdfs.delete(&to, false).map_err(to_error)?;
+            }
+
+            copy(from_hdfs, &from, to_hdfs, &to)
+        })
+        .await
+    }
+
+    /// It's only allowed for the same HDFS
+    async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        let from = HadoopFileSystem::path_to_filesystem(from);
+        let to = HadoopFileSystem::path_to_filesystem(to);
+
+        maybe_spawn_blocking(move || {
+            let hdfs = get_hdfs(&from)?;
+
+            hdfs.rename(&from, &to).map_err(to_error)?;
+
+            Ok(())
+        })
+        .await
+    }
+
+    /// Copy an object from one path to another, only if destination is empty.
+    /// Will return an error if the destination already has an object.
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        let from = HadoopFileSystem::path_to_filesystem(from);
+        let to = HadoopFileSystem::path_to_filesystem(to);
+
+        maybe_spawn_blocking(move || {
+            let to_hdfs = get_hdfs(&to)?;
+            if to_hdfs.exist(&to) {
+                return Err(Error::AlreadyExists {
+                    path: from,
+                    source: Box::new(HdfsErr::FileAlreadyExists(to.clone())),
+                });
+            }
+
+            let from_hdfs = get_hdfs(&from)?;
+            copy(from_hdfs, &from, to_hdfs, &to)
+        })
+        .await
+    }
 }
 
-fn to_error(err: HdfsErr) -> std::io::Error {
+/// Copy hdfs file from one filesystem to another. They may exist in different object store.
+fn copy(from_hdfs: Arc<HdfsFs>, from: &str, to_hdfs: Arc<HdfsFs>, to: &str) -> Result<()> {
+    hdfs::util::HdfsUtil::copy(from_hdfs.as_ref(), from, to_hdfs.as_ref(), to).map_err(to_error)?;
+
+    Ok(())
+}
+
+/// Get hdfs based on its path url
+fn get_hdfs(location: &str) -> Result<Arc<HdfsFs>> {
+    hdfs::hdfs::get_hdfs_by_full_path(location).map_err(to_error)
+}
+
+/// Convert HDFS file status to ObjectMeta
+pub fn convert_metadata(file: FileStatus) -> ObjectMeta {
+    ObjectMeta {
+        location: Path::from(file.name()),
+        last_modified: DateTime::<Utc>::from_utc(
+            NaiveDateTime::from_timestamp(file.last_modified(), 0),
+            Utc,
+        ),
+        size: file.len(),
+    }
+}
+
+/// Convert walkdir results and converts not-found errors into `None`.
+fn convert_walkdir_result(
+    res: std::result::Result<FileStatus, HdfsErr>,
+) -> Result<Option<FileStatus>> {
+    match res {
+        Ok(entry) => Ok(Some(entry)),
+        Err(walkdir_err) => match walkdir_err {
+            FileNotFound(_) => Ok(None),
+            _ => Err(to_error(HdfsErr::Generic(
+                "Fail to walk hdfs directory".to_owned(),
+            ))),
+        },
+    }
+}
+
+/// Takes a function and spawns it to a tokio blocking pool if available
+pub async fn maybe_spawn_blocking<F, T>(f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => runtime.spawn_blocking(f).await?,
+        Err(_) => f(),
+    }
+}
+
+fn to_error(err: HdfsErr) -> Error {
     match err {
-        HdfsErr::FileNotFound(err_str) => {
-            std::io::Error::new(std::io::ErrorKind::NotFound, err_str.as_str())
-        }
-        HdfsErr::FileAlreadyExists(err_str) => {
-            std::io::Error::new(std::io::ErrorKind::AlreadyExists, err_str.as_str())
-        }
-        HdfsErr::CannotConnectToNameNode(err_str) => {
-            std::io::Error::new(std::io::ErrorKind::NotConnected, err_str.as_str())
-        }
-        HdfsErr::InvalidUrl(err_str) => {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, err_str.as_str())
-        }
-        HdfsErr::Unknown => std::io::Error::new(std::io::ErrorKind::Other, "Unknown"),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::future::Future;
-    use std::pin::Pin;
-
-    use datafusion::assert_batches_eq;
-    use datafusion::datasource::file_format::parquet::ParquetFormat;
-    use datafusion::datasource::file_format::FileFormat;
-    use datafusion::datasource::listing::PartitionedFile;
-    use datafusion::error::Result;
-    use datafusion::physical_plan::file_format::FileScanConfig;
-    use datafusion::physical_plan::ExecutionPlan;
-    use datafusion::prelude::{SessionConfig, SessionContext};
-
-    use objectstore_hdfs_testing::util::run_hdfs_test;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn read_small_batches_from_hdfs() -> Result<()> {
-        run_hdfs_test("alltypes_plain.parquet".to_string(), |filename_hdfs| {
-            Box::pin(async move {
-                let session_context =
-                    SessionContext::with_config(SessionConfig::new().with_batch_size(2));
-                let projection = None;
-                let exec = get_hdfs_exec(filename_hdfs.as_str(), &projection, None).await?;
-                let stream = exec.execute(0, session_context.task_ctx()).await?;
-
-                let tt_batches = stream
-                    .map(|batch| {
-                        let batch = batch.unwrap();
-                        assert_eq!(11, batch.num_columns());
-                        assert_eq!(2, batch.num_rows());
-                    })
-                    .fold(0, |acc, _| async move { acc + 1i32 })
-                    .await;
-
-                assert_eq!(tt_batches, 4 /* 8/2 */);
-
-                // test metadata
-                assert_eq!(exec.statistics().num_rows, Some(8));
-                assert_eq!(exec.statistics().total_byte_size, Some(671));
-
-                Ok(())
-            })
-        })
-        .await
-    }
-
-    #[tokio::test]
-    async fn parquet_query() {
-        run_with_register_alltypes_parquet(|ctx| {
-            Box::pin(async move {
-                // NOTE that string_col is actually a binary column and does not have the UTF8 logical type
-                // so we need an explicit cast
-                let sql = "SELECT id, CAST(string_col AS varchar) FROM alltypes_plain";
-                let actual = ctx.sql(sql).await?.collect().await?;
-                let expected = vec![
-                    "+----+-----------------------------------------+",
-                    "| id | CAST(alltypes_plain.string_col AS Utf8) |",
-                    "+----+-----------------------------------------+",
-                    "| 4  | 0                                       |",
-                    "| 5  | 1                                       |",
-                    "| 6  | 0                                       |",
-                    "| 7  | 1                                       |",
-                    "| 2  | 0                                       |",
-                    "| 3  | 1                                       |",
-                    "| 0  | 0                                       |",
-                    "| 1  | 1                                       |",
-                    "+----+-----------------------------------------+",
-                ];
-
-                assert_batches_eq!(expected, &actual);
-
-                Ok(())
-            })
-        })
-        .await
-        .unwrap()
-    }
-
-    async fn get_hdfs_exec(
-        file_name: &str,
-        projection: &Option<Vec<usize>>,
-        limit: Option<usize>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let filename = file_name.to_string();
-        let format = ParquetFormat::default();
-        let file_schema = format
-            .infer_schema(hadoop_object_reader_stream(vec![filename.clone()]))
-            .await
-            .expect("Schema inference");
-        let statistics = format
-            .infer_stats(hadoop_object_reader(filename.clone()))
-            .await
-            .expect("Stats inference");
-        let file_groups = vec![vec![unpartitioned_file(filename.clone())]];
-        let exec = format
-            .create_physical_plan(
-                FileScanConfig {
-                    object_store: Arc::new(HadoopFileSystem {}),
-                    file_schema,
-                    file_groups,
-                    statistics,
-                    projection: projection.clone(),
-                    limit,
-                    table_partition_cols: vec![],
-                },
-                &[],
-            )
-            .await?;
-        Ok(exec)
-    }
-
-    /// Run query after table registered with parquet file on hdfs
-    pub async fn run_with_register_alltypes_parquet<F>(test_query: F) -> Result<()>
-    where
-        F: FnOnce(SessionContext) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>
-            + Send
-            + 'static,
-    {
-        run_hdfs_test("alltypes_plain.parquet".to_string(), |hdfs_file_uri| {
-            Box::pin(async move {
-                let ctx = SessionContext::new();
-                ctx.runtime_env()
-                    .register_object_store("hdfs", Arc::new(HadoopFileSystem {}));
-                let table_name = "alltypes_plain";
-                println!(
-                    "Register table {} with parquet file {}",
-                    table_name, hdfs_file_uri
-                );
-                ctx.register_parquet(table_name, &hdfs_file_uri).await?;
-
-                test_query(ctx).await
-            })
-        })
-        .await
-    }
-
-    /// Helper method to fetch the file size and date at given path and create a `FileMeta`
-    pub fn unpartitioned_file(file: String) -> PartitionedFile {
-        PartitionedFile {
-            file_meta: hadoop_unpartitioned_file(file),
-            partition_values: vec![],
-        }
+        HdfsErr::FileNotFound(path) => Error::NotFound {
+            path: path.clone(),
+            source: Box::new(HdfsErr::FileNotFound(path)),
+        },
+        HdfsErr::FileAlreadyExists(path) => Error::AlreadyExists {
+            path: path.clone(),
+            source: Box::new(HdfsErr::FileAlreadyExists(path)),
+        },
+        HdfsErr::InvalidUrl(path) => Error::InvalidPath {
+            source: path::Error::InvalidPath {
+                path: PathBuf::from(path),
+            },
+        },
+        HdfsErr::CannotConnectToNameNode(namenode_uri) => Error::Generic {
+            store: "HadoopFileSystem",
+            source: Box::new(HdfsErr::CannotConnectToNameNode(namenode_uri)),
+        },
+        HdfsErr::Generic(err_str) => Error::Generic {
+            store: "HadoopFileSystem",
+            source: Box::new(HdfsErr::Generic(err_str)),
+        },
     }
 }
