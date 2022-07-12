@@ -15,11 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use ballista::prelude::*;
-use datafusion::error::{DataFusionError, Result};
-use objectstore_hdfs_testing::util::run_hdfs_test;
 use std::future::Future;
 use std::pin::Pin;
+
+use ballista::prelude::*;
+use datafusion::error::{DataFusionError, Result};
+use datafusion::prelude::ParquetReadOptions;
+
+use objectstore_hdfs_testing::util::run_hdfs_test;
 
 /// This example demonstrates executing a simple query against an Arrow data source (CSV) and
 /// fetching results, using SQL
@@ -52,15 +55,15 @@ async fn main() -> Result<()> {
             Ok(())
         })
     })
-    .await?;
+        .await?;
 
     Ok(())
 }
 
 /// Run query after table registered with parquet file on hdfs
 pub async fn run_with_register_alltypes_parquet<F>(test_query: F) -> Result<()>
-where
-    F: FnOnce(BallistaContext) -> Pin<Box<dyn Future<Output = Result<()>> + 'static>>
+    where
+        F: FnOnce(BallistaContext) -> Pin<Box<dyn Future<Output=Result<()>> + 'static>>
         + Send
         + 'static,
 {
@@ -79,10 +82,11 @@ where
                 "Register table {} with parquet file {}",
                 table_name, filename_hdfs
             );
-            ctx.register_parquet(table_name, &filename_hdfs).await?;
+            ctx.register_parquet(table_name, &filename_hdfs, ParquetReadOptions::default())
+                .await?;
 
             test_query(ctx).await
         })
     })
-    .await
+        .await
 }

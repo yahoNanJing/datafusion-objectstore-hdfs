@@ -23,6 +23,12 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-datafusion = { git = "https://github.com/yahoNanJing/arrow-datafusion.git", branch = "issue-2072" }
-fs-hdfs = "0.1.6"
-uuid = { version = "0.8", features = ["v4"] }
+datafusion = { path = "../../arrow-datafusion-pivot/datafusion/core" }
+fs-hdfs = { path = "../../hdfs/fs-hdfs" }
+uuid = { version = "1.0", features = ["v4"] }
+
+[dev-dependencies]
+datafusion-objectstore-hdfs = { path = "../hdfs"}
+arrow = { version = "18.0.0", features = ["prettyprint"] }
+tokio = { version = "1.18", features = ["macros", "rt", "rt-multi-thread", "sync", "fs"] }
+futures = "0.3"
