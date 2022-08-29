@@ -86,16 +86,20 @@ impl HadoopFileSystem {
         }
     }
 
-    fn read_range(range: &Range<usize>, location: &String, file: &HdfsFile) -> Result<Bytes> {
+    fn read_range(range: &Range<usize>, file: &HdfsFile) -> Result<Bytes> {
         let to_read = range.end - range.start;
         let mut buf = vec![0; to_read];
         let read = file
             .read_with_pos(range.start as i64, buf.as_mut_slice())
             .map_err(to_error)?;
         assert_eq!(
-            to_read as i32, read,
+            to_read as i32,
+            read,
             "Read path {} from {} with expected size {} and actual size {}",
-            &location, range.start, to_read, read
+            file.path(),
+            range.start,
+            to_read,
+            read
         );
         Ok(buf.into())
     }
@@ -178,7 +182,7 @@ impl ObjectStore for HadoopFileSystem {
 
         maybe_spawn_blocking(move || {
             let file = hdfs.open(&location).map_err(to_error)?;
-            let buf = Self::read_range(&range, &location, &file)?;
+            let buf = Self::read_range(&range, &file)?;
             file.close().map_err(to_error)?;
 
             Ok(buf)
@@ -197,7 +201,7 @@ impl ObjectStore for HadoopFileSystem {
 
             let result = rs
                 .into_iter()
-                .map(|r| Self::read_range(&r, &location, &file))
+                .map(|r| Self::read_range(&r, &file))
                 .collect();
 
             file.close().map_err(to_error)?;
