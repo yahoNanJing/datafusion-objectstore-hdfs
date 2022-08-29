@@ -190,17 +190,20 @@ impl ObjectStore for HadoopFileSystem {
         let hdfs = self.hdfs.clone();
         let location = HadoopFileSystem::path_to_filesystem(location);
 
-        let file = hdfs.open(&location).map_err(to_error)?;
-        let file_clone = file.clone();
         let rs = ranges.to_vec();
 
         let result = maybe_spawn_blocking(move || {
-            rs.into_iter()
-                .map(|r| Self::read_range(&r, &location, &file_clone))
-                .collect()
+            let file = hdfs.open(&location).map_err(to_error)?;
+
+            let result = rs
+                .into_iter()
+                .map(|r| Self::read_range(&r, &location, &file))
+                .collect();
+
+            file.close().map_err(to_error)?;
+            result
         })
         .await;
-        file.close().map_err(to_error)?;
         result
     }
 
