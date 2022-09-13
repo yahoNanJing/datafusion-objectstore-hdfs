@@ -30,9 +30,10 @@ use futures::{stream::BoxStream, StreamExt};
 use hdfs::err::HdfsErr::FileNotFound;
 use hdfs::hdfs::{get_hdfs_by_full_path, FileStatus, HdfsErr, HdfsFs};
 use hdfs::walkdir::HdfsWalkDir;
-use object_store::path;
 use object_store::path::Path;
+use object_store::{path, MultipartId};
 use object_store::{Error, GetResult, ListResult, ObjectMeta, ObjectStore, Result};
+use tokio::io::AsyncWrite;
 
 /// scheme for HDFS File System
 pub static HDFS_SCHEME: &str = "hdfs";
@@ -115,6 +116,17 @@ impl ObjectStore for HadoopFileSystem {
             Ok(())
         })
         .await
+    }
+
+    async fn put_multipart(
+        &self,
+        _location: &Path,
+    ) -> Result<(MultipartId, Box<dyn AsyncWrite + Unpin + Send>)> {
+        todo!()
+    }
+
+    async fn abort_multipart(&self, _location: &Path, _multipart_id: &MultipartId) -> Result<()> {
+        todo!()
     }
 
     async fn get(&self, location: &Path) -> object_store::Result<GetResult> {
@@ -295,7 +307,6 @@ impl ObjectStore for HadoopFileSystem {
             }
 
             Ok(ListResult {
-                next_token: None,
                 common_prefixes: common_prefixes.into_iter().collect(),
                 objects,
             })
