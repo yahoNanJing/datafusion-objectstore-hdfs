@@ -28,7 +28,7 @@ use bytes::Bytes;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use futures::{stream::BoxStream, StreamExt};
 use hdfs::err::HdfsErr::FileNotFound;
-use hdfs::hdfs::{get_hdfs_by_full_path, FileStatus, HdfsErr, HdfsFs};
+use hdfs::hdfs::{get_hdfs_by_full_path, FileStatus, HdfsErr, HdfsFile, HdfsFs};
 use hdfs::walkdir::HdfsWalkDir;
 use object_store::path::Path;
 use object_store::{path, MultipartId};
@@ -84,6 +84,24 @@ impl HadoopFileSystem {
         } else {
             "".to_owned()
         }
+    }
+
+    fn read_range(range: &Range<usize>, file: &HdfsFile) -> Result<Bytes> {
+        let to_read = range.end - range.start;
+        let mut buf = vec![0; to_read];
+        let read = file
+            .read_with_pos(range.start as i64, buf.as_mut_slice())
+            .map_err(to_error)?;
+        assert_eq!(
+            to_read as i32,
+            read,
+            "Read path {} from {} with expected size {} and actual size {}",
+            file.path(),
+            range.start,
+            to_read,
+            read
+        );
+        Ok(buf.into())
     }
 }
 
@@ -164,23 +182,33 @@ impl ObjectStore for HadoopFileSystem {
 
         maybe_spawn_blocking(move || {
             let file = hdfs.open(&location).map_err(to_error)?;
-
-            let to_read = range.end - range.start;
-            let mut buf = vec![0; to_read];
-            let read = file
-                .read_with_pos(range.start as i64, buf.as_mut_slice())
-                .map_err(to_error)?;
-            assert_eq!(
-                to_read as i32, read,
-                "Read path {} from {} with expected size {} and actual size {}",
-                &location, range.start, to_read, read
-            );
-
+            let buf = Self::read_range(&range, &file)?;
             file.close().map_err(to_error)?;
 
-            Ok(buf.into())
+            Ok(buf)
         })
         .await
+    }
+
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> Result<Vec<Bytes>> {
+        let hdfs = self.hdfs.clone();
+        let location = HadoopFileSystem::path_to_filesystem(location);
+
+        let rs = ranges.to_vec();
+
+        let result = maybe_spawn_blocking(move || {
+            let file = hdfs.open(&location).map_err(to_error)?;
+
+            let result = rs
+                .into_iter()
+                .map(|r| Self::read_range(&r, &file))
+                .collect();
+
+            file.close().map_err(to_error)?;
+            result
+        })
+        .await;
+        result
     }
 
     async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
